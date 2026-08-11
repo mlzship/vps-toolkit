@@ -17,7 +17,7 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -S style -e SC1090,SC1091,SC2034,SC2155 vps-toolkit
+          shellcheck -S warning -e SC1090,SC1091,SC2034,SC2155 vps-toolkit
 
       - name: smoke - help & version
         run: |

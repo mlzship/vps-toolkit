@@ -387,7 +387,7 @@ tune_bbr(){
   conflict_guard
   step "精简 BBR 调优（BBR + fq + 按内存推导缓冲区）"
   bbr_snapshot_take
-  local tcp_max sock_max; read tcp_max sock_max < <(derive_buf)
+  local tcp_max sock_max; read -r tcp_max sock_max < <(derive_buf)
   local ram; ram=$(detect_ram_mb)
   info "内存 ${ram}MB → TCP 缓冲上限 $((tcp_max/1048576))MB / Socket 上限 $((sock_max/1048576))MB"
 
