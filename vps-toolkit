@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 022
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 REPO="mlzship/vps-toolkit"
 SELF_PATH="/usr/local/bin/vps-toolkit"
 STATE_DIR="/var/lib/vps-toolkit"
@@ -583,6 +583,341 @@ cmd_update(){
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# NodeSeek 发布模块（publish）
+# ═══════════════════════════════════════════════════════════════════════════
+
+NS_ENV="$HOME/.config/vps-toolkit/nodeseek.env"
+LLM_ENV="$HOME/.config/vps-toolkit/llm.env"
+NS_BASE="https://www.nodeseek.com"
+NS_UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+
+ns_load_env(){ [ -f "$NS_ENV" ] && . "$NS_ENV" 2>/dev/null; [ -n "${NODESEEK_COOKIE:-}" ]; }
+
+ns_guide_cookie(){
+  step "配置 NodeSeek 登录凭据（一次性）"
+  cat <<'EOF'
+  在你的 Mac 浏览器上取 Cookie（30 秒）：
+    1. 登录 www.nodeseek.com
+    2. Chrome/Edge/Arc 按 ⌘⌥I（Safari 需先在 设置→高级 勾选开发者菜单）
+    3. Network 标签 → 刷新页面 → 点任意请求 → Headers
+    4. 复制 Request Headers 里 Cookie: 的整行内容
+EOF
+  printf '  粘贴 Cookie（输入不回显）: '
+  read -rs ns_c; echo
+  [ -n "$ns_c" ] || { warn "未输入，取消配置"; return 1; }
+  case "$ns_c" in *session=*) ;; *) warn "Cookie 里未见 session= 字段，可能复制错了"; return 1 ;; esac
+  mkdir -p "$(dirname "$NS_ENV")"; chmod 700 "$(dirname "$NS_ENV")"
+  printf "NODESEEK_COOKIE='%s'\n" "$ns_c" > "$NS_ENV"; chmod 600 "$NS_ENV"
+  ns_check_auth && { ok "凭据验证通过，已保存: $NS_ENV"; return 0; }
+  warn "凭据验证未通过（仍已保存，可稍后重试）"; return 1
+}
+
+# 探活：返回 AUTH_OK / AUTH_FAIL / CF / NET
+ns_check_auth(){
+  ns_load_env || return 1
+  local code body
+  body=$(curl -sS --compressed --max-time 15 -A "$NS_UA" -H "Cookie: $NODESEEK_COOKIE" \
+    "$NS_BASE/new-discussion" -o /tmp/.ns-probe.html -w "%{http_code}" 2>/dev/null) || { echo NET; return 1; }
+  case "$body" in
+    200) grep -q "new-discussion" /tmp/.ns-probe.html && grep -q "重要提醒" /tmp/.ns-probe.html \
+           && { echo AUTH_OK; return 0; } || { echo AUTH_FAIL; return 1; } ;;
+    403|503) echo CF; return 1 ;;
+    401) echo AUTH_FAIL; return 1 ;;
+    *) echo NET; return 1 ;;
+  esac
+}
+
+ns_gen_csrf(){ tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16; }
+
+# ns_post <title> <content_file> <category> → stdout: JSON 响应；返回码 0=成功
+ns_post(){
+  local title="$1" content_file="$2" category="$3"
+  ns_load_env || return 1
+  local csrf payload resp code
+  csrf=$(ns_gen_csrf)
+  payload=$(python3 - "$title" "$content_file" "$category" <<'PYEOF'
+import json, sys
+title, cf, cat = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({"content": open(cf, encoding='utf-8').read(),
+                  "mode": "new-discussion", "title": title,
+                  "category": cat, "rank": 0}))
+PYEOF
+)
+  resp=$(curl -sS --compressed --max-time 30 -X POST -A "$NS_UA" \
+    -H "Cookie: $NODESEEK_COOKIE" -H "Content-Type: application/json" \
+    -H "Csrf-Token: $csrf" -H "Referer: $NS_BASE/new-discussion" \
+    -H "Origin: $NS_BASE" -H "X-Requested-With: XMLHttpRequest" \
+    -d "$payload" -w "\n%{http_code}" "$NS_BASE/api/content/new-discussion" 2>/dev/null) || return 2
+  code=${resp##*$'\n'}; resp=${resp%$'\n'*}
+  case "$code" in
+    200) printf '%s' "$resp"; return 0 ;;
+    401|403) echo '{"success":false,"message":"AUTH_OR_CF"}'; return 3 ;;
+    *) printf '{"success":false,"message":"HTTP %s: %s"}' "$code" "$resp"; return 4 ;;
+  esac
+}
+
+# ── 规则引擎：从报告目录生成评价句 ──────────────────────────────────────────
+rule_verdicts(){ # <report_dir> → 输出评价句（每行一句）
+  local dir="$1" line zero total r
+  # TCPQuality 回国连通
+  if [ -f "$dir/.results" ]; then
+    line=$(grep tcpq "$dir/.results" | tail -1)
+    zero=$(echo "$line" | grep -oE 'zero_loss=[0-9?]+' | cut -d= -f2)
+    total=93; echo "$line" | grep -q tcpq_quick && total=18
+    if [ "$zero" = "0" ]; then
+      echo "大陆方向全部探测节点 100% 丢包，IP 处于封锁状态。"
+    elif [ "$zero" != "?" ] && [ -n "$zero" ]; then
+      if [ "$zero" -ge 70 ] 2>/dev/null || { [ "$total" = 18 ] && [ "$zero" -ge 14 ] 2>/dev/null; }; then
+        echo "回国连通良好：${total} 个探测节点中 ${zero} 个零丢包。"
+      else
+        echo "回国连通一般：${total} 节点中 ${zero} 个零丢包，存在劣化节点。"
+      fi
+    fi
+  fi
+  # 回程线路标签（北京行做代表）
+  local tq_log; tq_log=$(ls "$dir"/*tcpquality*.log 2>/dev/null | head -1)
+  if [ -n "$tq_log" ]; then
+    local bj ct cu cm
+    bj=$(strip_ansi "$tq_log" | grep -E "^  北京" | head -1)
+    ct=$(echo "$bj" | grep -oE "CN2GIA|163" | head -1); cu=$(echo "$bj" | grep -oE "4837|AS10099|CMIN2" | head -1)
+    cm=$(echo "$bj" | grep -oE "CMIN2|CMI" | head -1)
+    [ -n "$ct$cu$cm" ] && echo "回程线路（北京，据探测）：电信 ${ct:-?} / 联通 ${cu:-?} / 移动 ${cm:-?}。"
+    # 测速汇总
+    local speeds
+    speeds=$(strip_ansi "$tq_log" | grep -oE '[0-9.]+Mbps' | grep -v '^0\.' | sort -t. -k1 -rn | head -1)
+    [ -n "$speeds" ] && echo "单线程测速最高 ${speeds}（详见在线报告）。"
+  fi
+  # IPQuality
+  local ip_log="$dir/01-ipquality.log"
+  if [ -f "$ip_log" ]; then
+    local stats marked banned
+    stats=$(strip_ansi "$ip_log" | grep -oE "有效 *[0-9]+ *正常 *[0-9]+ *已标记 *[0-9]+ *黑名单 *[0-9]+" | head -1)
+    if [ -n "$stats" ]; then
+      marked=$(echo "$stats" | grep -oE "已标记 *[0-9]+" | grep -oE '[0-9]+')
+      banned=$(echo "$stats" | grep -oE "黑名单 *[0-9]+$" | grep -oE '[0-9]+')
+      if [ "${banned:-0}" = 0 ] && [ "${marked:-0}" = 0 ]; then
+        echo "IP 纯度：全部黑名单数据库均无标记。"
+      else
+        echo "IP 纯度：黑名单库中 ${marked:-0} 个有标记、${banned:-0} 个列入黑名单。"
+      fi
+    fi
+  fi
+}
+
+# ── 帖子渲染 ────────────────────────────────────────────────────────────────
+render_post(){ # <report_dir> <title_out_var> <content_out_file>
+  local dir="$1"
+  local profile zero link ip_link verdicts
+  profile=$(grep -m1 '机器:' "$dir/SUMMARY.md" 2>/dev/null | sed 's/.*机器: //')
+  [ -f "$dir/.results" ] && {
+    zero=$(grep tcpq "$dir/.results" | tail -1 | grep -oE 'zero_loss=[0-9?]+' | cut -d= -f2)
+    link=$(grep tcpq "$dir/.results" | tail -1 | grep -oE 'link=https?[^ ]+' | cut -d= -f2)
+  }
+  ip_link=$(extract_links "$dir/01-ipquality.log" 2>/dev/null | grep -i svg | head -1)
+  verdicts=$(rule_verdicts "$dir")
+
+  local loc_word; loc_word=$(echo "$profile" | awk -F'·' '{print $2}' | xargs | awk '{print $1" "$2}')
+  local headline="总体正常"
+  echo "$verdicts" | grep -q "封锁" && headline="大陆方向封锁确诊记录"
+  [ "${zero:-?}" != "?" ] && [ "${zero:-0}" != "0" ] && headline="回国连通与调优实测"
+
+  eval "$2=\"【vps-toolkit 体检】${loc_word} · ${headline}\""
+  {
+    echo "## 机器画像"
+    echo
+    echo "$profile"
+    echo
+    echo "## 检测结论"
+    echo
+    echo '```'
+    echo "$verdicts"
+    echo '```'
+    echo
+    echo "## 在线报告"
+    echo
+    [ -n "${link:-}" ] && [ "${link:-}" != "无" ] && echo "- TCP 回国质量报告：$link"
+    [ -n "$ip_link" ] && { echo "- IP 质量报告："; echo; echo "![]($ip_link)"; }
+    echo
+    echo "—— 本文由 vps-toolkit v$VERSION 自动生成，数据为实测结果"
+  } > "$3"
+}
+
+# ── nodeimage 图床 ──────────────────────────────────────────────────────────
+nodeimage_upload(){ # <图片路径> → stdout 输出 markdown 插图串
+  ns_load_env
+  local key="${NODEIMAGE_API_KEY:-}"
+  [ -n "$key" ] || { warn "未配置 NODEIMAGE_API_KEY（登录 nodeimage.com 账号页生成），跳过图片上传"; return 1; }
+  [ -f "$1" ] || { warn "图片不存在: $1"; return 1; }
+  local resp
+  resp=$(curl -sS --max-time 60 -X POST "https://api.nodeimage.com/api/upload" \
+    -H "X-API-Key: $key" -F "image=@$1" 2>/dev/null) || { warn "图床请求失败"; return 2; }
+  local ok_ md
+  ok_=$(printf '%s' "$resp" | grep -o '"success":true' || true)
+  if [ -n "$ok_" ]; then
+    md=$(printf '%s' "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['links']['markdown'])")
+    ok "图片已上传: $1"
+    printf '%s\n' "$md"; return 0
+  fi
+  local err; err=$(printf '%s' "$resp" | grep -oE '"error":"[^"]*"' | head -1)
+  warn "图床上传失败: ${err:-$resp}"
+  return 3
+}
+
+# ── AI 润色（可选） ─────────────────────────────────────────────────────────
+render_ai(){ # <摘要文件> → stdout: AI 评价文本；失败返回非 0
+  [ -f "$LLM_ENV" ] || return 1
+  . "$LLM_ENV"
+  [ -n "${LLM_KEY:-}" ] || return 1
+  local ep="${LLM_ENDPOINT:-https://api.deepseek.com/v1}" model="${LLM_MODEL:-deepseek-chat}"
+  local data; data=$(cat "$1")
+  echo "  将发送给 LLM 的数据（${ep##*://}，${model}）：" >&2
+  echo "$data" | head -20 | sed 's/^/    /' >&2
+  confirm "确认调用 AI 生成评价？" >&2 || return 2
+  local prompt resp
+  prompt=$(python3 - "$data" <<'PYEOF'
+import json, sys
+data = sys.argv[1]
+body = {"model": "", "messages": [
+  {"role": "system", "content": "你是 VPS 测评编辑。只使用给定数据写 150 字以内的中文测评总结与评价，禁止编造商家、线路、价格等未提供的信息。"},
+  {"role": "user", "content": data}]}
+print(json.dumps(body, ensure_ascii=False))
+PYEOF
+)
+  resp=$(python3 - "$ep" "$model" "$LLM_KEY" "$prompt" <<'PYEOF'
+import json, sys, urllib.request
+ep, model, key, body = sys.argv[1:5]
+b = json.loads(body); b["model"] = model
+req = urllib.request.Request(ep.rstrip('/') + "/chat/completions",
+    data=json.dumps(b).encode(), headers={"Authorization": "Bearer " + key,
+    "Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.load(r)
+        print(d["choices"][0]["message"]["content"].strip())
+except Exception as e:
+    print("LLM_ERROR: " + str(e), file=sys.stderr); sys.exit(1)
+PYEOF
+) || { warn "AI 调用失败，已降级为规则模板"; return 1; }
+  printf '%s' "$resp"
+}
+
+# ── publish 主流程 ──────────────────────────────────────────────────────────
+cmd_publish(){
+  need_root
+  local dry=0 cat_="" report="" use_ai=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --category) cat_="$2"; shift 2 ;;
+      --report) report="$2"; shift 2 ;;
+      --ai) use_ai=1; shift ;;
+      --image) warn "--image 请在菜单流程中使用（或先配置 NODEIMAGE_API_KEY）"; shift 2 ;;
+      *) die "未知参数: $1" ;;
+    esac
+  done
+
+  # 选报告
+  [ -d "$REPORT_ROOT" ] || die "还没有任何报告（先跑 quick/full）"
+  local dirs
+  dirs=$(ls -1t "$REPORT_ROOT" 2>/dev/null | head -5)
+  [ -n "$dirs" ] || die "还没有任何报告"
+  if [ -z "$report" ]; then
+    step "选择要发布的报告"
+    local i=1 d
+    for d in $dirs; do
+      local s="$REPORT_ROOT/$d/SUMMARY.md"
+      printf '  %d) %s  %s\n' "$i" "$d" "$(grep -m1 '机器:' "$s" 2>/dev/null | sed 's/.*机器: //' | cut -c1-30)"
+      i=$((i+1))
+    done
+    printf '  选择 [1]: '; read -r pick
+    report=$(echo "$dirs" | sed -n "${pick:-1}p")
+  fi
+  [ -d "$REPORT_ROOT/$report" ] || die "报告不存在: $report"
+  info "报告: $REPORT_ROOT/$report"
+
+  # 防重复
+  if [ -f "$REPORT_ROOT/$report/.published" ]; then
+    warn "该报告已发布过: $(cat "$REPORT_ROOT/$report/.published")"
+    confirm "确认要再次发布？" || { info "已取消"; return 0; }
+  fi
+
+  # 渲染
+  local title="" content_f; content_f=$(mktemp)
+  render_post "$REPORT_ROOT/$report" title "$content_f"
+
+  # AI 润色（可选）
+  if [ "$use_ai" = 1 ]; then
+    step "AI 评价生成"
+    local summary_f ai_text
+    summary_f="$REPORT_ROOT/$report/SUMMARY.md"
+    if ai_text=$(render_ai "$summary_f"); then
+      { echo; echo "## AI 评价"; echo; echo "$ai_text"; echo; echo "*（AI 生成，仅供参考）*"; } >> "$content_f"
+      ok "AI 评价已插入"
+    else
+      warn "AI 未启用或失败，使用规则模板评价"
+    fi
+  fi
+
+  # 标题可编辑
+  printf '  标题（直接回车采用默认）\n  默认: %s\n  自定义: ' "$title"
+  local custom_t; read -r custom_t
+  [ -n "$custom_t" ] && title="$custom_t"
+
+  # 预览
+  step "帖子预览"
+  rule
+  echo "  标题: $title"
+  echo "  板块: ${cat_:-sandbox}"
+  echo "  正文（共 $(wc -l < "$content_f") 行）:"
+  head -40 "$content_f" | sed 's/^/    /'
+  [ "$(wc -l < "$content_f")" -gt 40 ] && echo "    …（余下省略）"
+  rule
+
+  [ "$dry" = 1 ] && { ok "dry-run 完成，未发送"; rm -f "$content_f"; return 0; }
+
+  # 凭据检查
+  if ! ns_load_env; then ns_guide_cookie || return 1; fi
+  case "$(ns_check_auth)" in
+    AUTH_OK) ok "凭据有效" ;;
+    AUTH_FAIL) warn "Cookie 已失效"; ns_guide_cookie || return 1 ;;
+    CF) die "被 Cloudflare 拦截：请更新 Cookie 或换网络环境" 2 ;;
+    *) die "网络异常，无法连接 NodeSeek" 2 ;;
+  esac
+
+  # 板块
+  if [ -z "$cat_" ]; then
+    local last_cat="sandbox"
+    [ -f "$NS_ENV" ] && last_cat=$(grep -oE 'NS_LAST_CATEGORY=[a-z-]+' "$NS_ENV" 2>/dev/null | cut -d= -f2 || echo sandbox)
+    printf '  板块 [默认 %s，可选 review/tech/daily/sandbox…]: ' "${last_cat:-sandbox}"
+    read -r cat_; cat_="${cat_:-${last_cat:-sandbox}}"
+  fi
+
+  confirm "确认发布到 NodeSeek（板块: $cat_）？" || { info "已取消"; rm -f "$content_f"; return 0; }
+
+  step "发送中"
+  local resp
+  if resp=$(ns_post "$title" "$content_f" "$cat_"); then
+    local pid
+    pid=$(printf '%s' "$resp" | grep -oE '"redirect":"/post-[0-9]+' | grep -oE '[0-9]+$' || true)
+    [ -z "$pid" ] && pid=$(printf '%s' "$resp" | grep -oE '"post_id":[0-9]+|"id":[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+    local url="$NS_BASE/post-${pid}-1"
+    if [ -n "$pid" ]; then
+      ok "发布成功: $url"
+      echo "$url" > "$REPORT_ROOT/$report/.published"
+      grep -q NS_LAST_CATEGORY "$NS_ENV" 2>/dev/null || echo "NS_LAST_CATEGORY=$cat_" >> "$NS_ENV"
+      info "如需修改，可在网页上编辑自己的帖子"
+    else
+      ok "服务端已受理，响应: $resp"
+    fi
+  else
+    local rc=$?
+    warn "发布失败（$rc）: $resp"
+    case "$resp" in *AUTH_OR_CF*) warn "认证或 CF 问题：请更新 Cookie" ;; esac
+  fi
+  rm -f "$content_f"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 交互菜单
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -665,6 +1000,7 @@ menu_main(){
   5) 一键闭环 boost  基线 → 调优 → 复测 → 对比
   6) 历史报告
   7) 检查更新
+  8) 发布到 NodeSeek
   0) 退出
 EOF
     printf '  请选择: '; read -r c
@@ -679,6 +1015,7 @@ EOF
         break_end ;;
       6) cmd_reports; break_end ;;
       7) cmd_update; break_end ;;
+      8) cmd_publish; break_end ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -705,6 +1042,8 @@ vps-toolkit v$VERSION — VPS 体检 + TCP 调优编排器
   vps-toolkit tune --status    当前调优状态
   vps-toolkit boost [--bbr|--tcpfit]  基线→调优→复测→对比
   vps-toolkit reports          历史报告
+  vps-toolkit publish [--dry-run] [--report 目录] [--category slug] [--ai]
+                               渲染并发布最近报告到 NodeSeek
   vps-toolkit update           检查更新
   vps-toolkit status           系统画像
   vps-toolkit --version        版本号
@@ -727,6 +1066,7 @@ main(){
     boost) shift; cmd_boost "$@" ;;
     reports) cmd_reports ;;
     update) cmd_update ;;
+    publish) shift; cmd_publish "$@" ;;
     status) profile_line ;;
     --help|-h|help) usage ;;
     --version|-v) echo "vps-toolkit v$VERSION" ;;
