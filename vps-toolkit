@@ -1,0 +1,734 @@
+#!/usr/bin/env bash
+# vps-toolkit — VPS 体检 + TCP 调优一体化编排器
+#
+# 只编排活跃上游，不 fork 代码；运行期现拉官方版本。
+# 上游：xykt/IPQuality · oneclickvirt/ecs · ibsgss/TcpQuality · Kylin010/tcpfit
+#
+# 用法:
+#   vps-toolkit                 交互菜单
+#   vps-toolkit quick|full      快速/完整体检
+#   vps-toolkit ip|ecs|tcp      单项检测
+#   vps-toolkit tune --bbr|--tcpfit [args] | --rollback
+#   vps-toolkit boost [--bbr|--tcpfit]
+#   vps-toolkit reports|status|update
+#
+# 退出码: 0 成功 / 1 参数或环境错误 / 2 上游失败
+
+set -uo pipefail
+umask 022
+
+VERSION="0.1.0"
+REPO="mlzship/vps-toolkit"
+SELF_PATH="/usr/local/bin/vps-toolkit"
+STATE_DIR="/var/lib/vps-toolkit"
+REPORT_ROOT="/root/vps-toolkit-reports"
+CACHE_DIR="/tmp/vps-toolkit-cache"
+LOCK_FILE="/var/lock/vps-toolkit.lock"
+SYSCTL_BBR="/etc/sysctl.d/99-vpscheck-bbr.conf"
+BBR_SNAPSHOT="$STATE_DIR/bbr.snapshot"
+TUNED_MARK="$STATE_DIR/tuned"
+TCPFIT_VERSION="0.3.8"   # 已全量源码审查的固定版本
+export TERM="${TERM:-xterm}"
+
+# ── 输出原语 ────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  C_GREEN=$'\033[0;32m'; C_RED=$'\033[0;31m'; C_YEL=$'\033[0;33m'
+  C_CYAN=$'\033[0;36m';  C_BOLD=$'\033[1m';  C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_GREEN=''; C_RED=''; C_YEL=''; C_CYAN=''; C_BOLD=''; C_DIM=''; C_OFF=''
+fi
+info(){ printf '%s %s\n' "${C_CYAN}[*]${C_OFF}" "$*"; }
+ok(){   printf '%s %s\n' "${C_GREEN}[+]${C_OFF}" "$*"; }
+warn(){ printf '%s %s\n' "${C_YEL}[!]${C_OFF}" "$*" >&2; }
+die(){  printf '%s %s\n' "${C_RED}[x]${C_OFF}" "$*" >&2; exit "${2:-1}"; }
+rule(){ printf '  %s%s%s\n' "$C_DIM" "────────────────────────────────────────" "$C_OFF"; }
+step(){ printf '\n  %s▸ %s%s\n' "${C_CYAN}${C_BOLD}" "$*" "$C_OFF"; }
+
+# CJK 显示宽度：按 UTF-8 前导字节计算（ASCII=1, 续字节=0, 2字节序列=1, 3字节及以上=2）
+_dispw(){
+  printf '%s' "$1" | LC_ALL=C od -An -tu1 2>/dev/null | awk '
+    {for(i=1;i<=NF;i++){b=$i
+       if(b<128)            n++
+       else if(b<192)       continue
+       else if(b<224)       n++
+       else                 n+=2
+    }} END{print n+0}'
+}
+_pad(){ local w; w=$(_dispw "$1"); printf '%s%*s' "$1" $(( $2 - w )) ""; }
+kv(){ printf '  %s %s\n' "$(_pad "$1" 18)" "$2"; }
+
+confirm(){ # confirm <提示> —— 输入 y 才继续
+  local ans
+  printf '  %s%s%s [y/N]: ' "$C_YEL" "$1" "$C_OFF"
+  read -r ans
+  [ "$ans" = "y" ] || [ "$ans" = "Y" ]
+}
+
+# 旋转指示器（非 tty 自动降级为静默等待）
+SPIN_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+spin_wait(){
+  local pid="$1" msg="$2" i=0
+  if [ ! -t 2 ]; then wait "$pid" 2>/dev/null; return $?; fi
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s' "$C_CYAN" "${SPIN_FRAMES:$((i++%10)):1}" "$C_OFF" "$msg" >&2
+    sleep 0.12
+  done
+  printf '\r\033[K' >&2
+  wait "$pid" 2>/dev/null
+}
+
+take_lock(){
+  command -v flock >/dev/null || return 0
+  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+  [ -w "$(dirname "$LOCK_FILE")" ] || return 0
+  exec 9>"$LOCK_FILE" || return 0
+  flock -n 9 || die "另一个 vps-toolkit 正在运行（锁: $LOCK_FILE），等它结束再试"
+}
+
+need_root(){ [ "$(id -u)" = 0 ] || die "需要 root 权限"; }
+
+# ── 流量计量 ────────────────────────────────────────────────────────────────
+TRAFFIC_RX0=""; TRAFFIC_TX0=""
+detect_iface(){ ip route show default 2>/dev/null | awk '{print $5; exit}'; }
+traffic_mark(){
+  local i; i=$(detect_iface)
+  TRAFFIC_RX0=$(cat "/sys/class/net/$i/statistics/rx_bytes" 2>/dev/null || echo 0)
+  TRAFFIC_TX0=$(cat "/sys/class/net/$i/statistics/tx_bytes" 2>/dev/null || echo 0)
+}
+traffic_report(){
+  [ -n "$TRAFFIC_TX0" ] || return 0
+  local i rx tx; i=$(detect_iface)
+  rx=$(( $(cat "/sys/class/net/$i/statistics/rx_bytes" 2>/dev/null || echo 0) - TRAFFIC_RX0 ))
+  tx=$(( $(cat "/sys/class/net/$i/statistics/tx_bytes" 2>/dev/null || echo 0) - TRAFFIC_TX0 ))
+  [ "$rx" -lt 0 ] && rx=0; [ "$tx" -lt 0 ] && tx=0
+  awk -v tx="$tx" -v rx="$rx" 'BEGIN{
+    function h(b){ if(b>=1073741824) return sprintf("%.2f GB", b/1073741824); return sprintf("%.0f MB", b/1048576) }
+    printf "  %s本次流量消耗%s  上传 %s / 下载 %s\n", "'"$C_DIM"'", "'"$C_OFF"'", h(tx), h(rx)}'
+}
+
+# ── 下载器（国家自适应 + 校验） ─────────────────────────────────────────────
+COUNTRY=""
+detect_country(){ [ -n "$COUNTRY" ] || COUNTRY=$(curl -fsSL --max-time 8 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]'); echo "$COUNTRY"; }
+
+# download <url> <输出文件> —— 直连失败且身处 CN 时回退代理前缀
+download(){
+  local url="$1" out="$2" proxies=""
+  mkdir -p "$(dirname "$out")"
+  if curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$out" 2>/dev/null; then return 0; fi
+  if [ "$(detect_country)" = "CN" ]; then
+    proxies="${VPSK_GH_PROXY:-https://ghfast.top/} https://gh-proxy.com/"
+    local p
+    for p in $proxies; do
+      curl -fsSL --connect-timeout 10 --max-time 120 "${p}${url}" -o "$out" 2>/dev/null && return 0
+    done
+  fi
+  return 1
+}
+
+# download_script <url> <输出文件> —— 脚本专用：必须非空且首行是 shebang
+download_script(){
+  download "$1" "$2" || return 1
+  { [ -s "$2" ] && head -1 "$2" | grep -q '^#!'; } || { warn "下载的脚本校验失败: $1"; return 1; }
+}
+
+# ── 系统画像 ────────────────────────────────────────────────────────────────
+detect_ram_mb(){ free -m | awk '/^Mem:/{print $2}'; }
+
+check_swap(){ # 重型测试前调用：无 swap 自动补 1G（可用 VPSK_NO_SWAP=1 跳过）
+  [ "${VPSK_NO_SWAP:-0}" = 1 ] && return 0
+  swapon --show 2>/dev/null | grep -q . && return 0
+  [ "$(id -u)" = 0 ] || return 0
+  info "检测到无 swap，临时补充 1G（防止重型测试 OOM）"
+  fallocate -l 1G /swapfile.vpsk 2>/dev/null || dd if=/dev/zero of=/swapfile.vpsk bs=1M count=1024 status=none
+  chmod 600 /swapfile.vpsk && mkswap /swapfile.vpsk >/dev/null 2>&1 && swapon /swapfile.vpsk \
+    && ok "swap 已补充 1G（/swapfile.vpsk，重启失效）" || warn "swap 补充失败，继续运行"
+}
+
+profile_line(){
+  local ip loc cc qd ram cpu kn
+  ip=$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || echo "?")
+  loc=$(curl -fsSL --max-time 8 "https://ipinfo.io/${ip}/json" 2>/dev/null \
+        | awk -F'"' '/"city"/{c=$4} /"org"/{o=$4} END{print c" "o}')
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+  ram=$(detect_ram_mb); cpu=$(nproc); kn=$(uname -r)
+  local tuned="未调优"; [ -f "$TUNED_MARK" ] && tuned="已调优($(cat "$TUNED_MARK" 2>/dev/null))"
+  echo "${ip} · ${loc:-未知归属} · ${cpu}C/${ram}M · 内核${kn} · ${cc}/${qd} · ${tuned}"
+}
+
+# ── run_tool 包装器：计时 + 日志落盘 + 失败不中断 ───────────────────────────
+REPORT_DIR=""
+TOOL_RESULTS=""   # 累积: 名称|状态|备注
+setup_report(){
+  REPORT_DIR="$REPORT_ROOT/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$REPORT_DIR"
+  info "报告目录: $REPORT_DIR"
+}
+record_result(){ TOOL_RESULTS="${TOOL_RESULTS}$1|$2|$3\n"; }
+
+run_tool(){ # run_tool <名称> <日志文件> <命令...>
+  local name="$1" log="$2"; shift 2
+  step "运行: $name"
+  local t0=$SECONDS rc
+  if [ -t 2 ]; then
+    "$@" > "$log" 2>&1 & spin_wait $! "$name 运行中…"; rc=$?
+  else
+    "$@" > "$log" 2>&1; rc=$?
+  fi
+  if [ $rc -eq 0 ]; then
+    ok "$name 完成（$((SECONDS-t0))s）→ $log"
+  else
+    warn "$name 失败（退出码 $rc），日志: $log"
+  fi
+  return $rc
+}
+
+# ── 上游地址 ────────────────────────────────────────────────────────────────
+UPSTREAM_IPQ="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
+UPSTREAM_ECS="https://raw.githubusercontent.com/oneclickvirt/ecs/master/goecs.sh"
+UPSTREAM_TCPQ="https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh"
+UPSTREAM_TCPFIT="https://raw.githubusercontent.com/Kylin010/tcpfit/v${TCPFIT_VERSION}/tcpfit.sh"
+
+fetch_upstream(){ # fetch_upstream <url> <文件名>
+  mkdir -p "$CACHE_DIR"
+  download_script "$1" "$CACHE_DIR/$2" || die "拉取上游失败: $1（网络问题或官方源变更）" 2
+  chmod +x "$CACHE_DIR/$2"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 检测模块
+# ═══════════════════════════════════════════════════════════════════════════
+
+strip_ansi(){ sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$1"; }
+
+extract_links(){ strip_ansi "$1" | grep -oE 'https?://[^ ]*(Check\.Place|tcpquality|Report)[^ ]*' | sort -u; }
+
+test_ip(){
+  step "IP 质量深度体检（IPQuality）"
+  fetch_upstream "$UPSTREAM_IPQ" ip.sh
+  local log="$REPORT_DIR/01-ipquality.log"
+  traffic_mark
+  run_tool "IPQuality" "$log" bash "$CACHE_DIR/ip.sh"; local rc=$?
+  traffic_report
+  local links; links=$(extract_links "$log" | head -3)
+  record_result "IPQuality" "$([ $rc -eq 0 ] && echo OK || echo FAILED)" "${links:-无报告链接}"
+  [ -n "$links" ] && { echo "  报告链接:"; echo "$links" | sed 's/^/    /'; }
+  return $rc
+}
+
+# TCPQuality 结果解析：返回 "零丢包节点数|报告链接"
+parse_tcpq(){
+  local log="$1"
+  local zero links
+  zero=$(strip_ansi "$log" | grep -oE "零丢包: *[0-9]+" | head -1 | grep -oE '[0-9]+')
+  links=$(strip_ansi "$log" | grep -oE 'https://tcpquality[^ ]*' | head -1)
+  echo "${zero:-?}|${links:-无}"
+}
+
+test_tcp_quick(){
+  step "TCP 回国探测（三省市 18 节点）"
+  fetch_upstream "$UPSTREAM_TCPQ" runTcpQuality.sh
+  local log="$REPORT_DIR/03-tcpquality-quick.log"
+  traffic_mark
+  run_tool "TCPQuality-快速" "$log" env TERM=xterm bash "$CACHE_DIR/runTcpQuality.sh" -v4 -bj -sh -gd; local rc=$?
+  traffic_report
+  local parsed zero links cls
+  parsed=$(parse_tcpq "$log"); zero=${parsed%%|*}; links=${parsed##*|}
+  if [ "$zero" = "0" ]; then
+    cls="检出异常：大陆方向全部节点 100% 丢包（疑似 IP 被封锁）"
+    warn "$cls"
+  elif [ "$zero" = "?" ]; then
+    cls="执行失败或结果无法解析"
+  else
+    cls="正常：大陆方向零丢包节点 ${zero} 个"
+    ok "$cls"
+  fi
+  record_result "TCPQuality-快速" "$([ $rc -eq 0 ] && [ "$zero" != "?" ] && echo OK || echo FAILED)" "零丢包:$zero $links"
+  [ "$links" != "无" ] && echo "  报告链接: $links"
+  echo "VPSK_RESULT::tcpq_quick zero_loss=$zero link=$links" >> "$REPORT_DIR/.results"
+  return $rc
+}
+
+test_tcp_full(){
+  step "TCP 回国全量探测（IPv4/IPv6/教育网/国际/三网测速）"
+  fetch_upstream "$UPSTREAM_TCPQ" runTcpQuality.sh
+  local log="$REPORT_DIR/04-tcpquality-full.log"
+  traffic_mark
+  run_tool "TCPQuality-全量" "$log" env TERM=xterm bash "$CACHE_DIR/runTcpQuality.sh" --all; local rc=$?
+  traffic_report
+  local parsed zero links
+  parsed=$(parse_tcpq "$log"); zero=${parsed%%|*}; links=${parsed##*|}
+  record_result "TCPQuality-全量" "$([ $rc -eq 0 ] && echo OK || echo FAILED)" "零丢包:$zero $links"
+  [ "$links" != "无" ] && echo "  报告链接: $links"
+  echo "VPSK_RESULT::tcpq_full zero_loss=$zero link=$links" >> "$REPORT_DIR/.results"
+  return $rc
+}
+
+test_ecs(){
+  step "融合怪综合体检（ecs/goecs）"
+  fetch_upstream "$UPSTREAM_ECS" goecs.sh
+  command -v goecs >/dev/null 2>&1 || {
+    info "安装 goecs…"
+    noninteractive=true bash "$CACHE_DIR/goecs.sh" install > "$REPORT_DIR/02-ecs-install.log" 2>&1 \
+      || { record_result "ecs" FAILED "安装失败"; warn "goecs 安装失败"; return 2; }
+  }
+  command -v iperf3 >/dev/null 2>&1 || { info "补装 iperf3"; apt-get install -y -qq iperf3 >/dev/null 2>&1; }
+  local log="$REPORT_DIR/02-ecs.log"
+  check_swap
+  traffic_mark
+  run_tool "ecs" "$log" env noninteractive=true goecs -l=zh
+  local rc=$?
+  traffic_report
+  record_result "ecs" "$([ $rc -eq 0 ] && echo OK || echo FAILED)" "详见日志"
+  return $rc
+}
+
+gen_summary(){
+  local f="$REPORT_DIR/SUMMARY.md"
+  {
+    echo "# vps-toolkit 体检汇总"
+    echo
+    echo "- 时间: $(date '+%F %T %Z')"
+    echo "- 版本: v$VERSION"
+    echo "- 机器: $(profile_line)"
+    echo
+    echo "## 各工具结果"
+    echo
+    printf '%b' "$TOOL_RESULTS" | awk -F'|' 'NF>=3{printf "- **%s**: %s — %s\n", $1, $2, $3}'
+    echo
+    echo "## 系统概览"
+    echo
+    echo '```'
+    uname -a
+    echo
+    free -h | head -2
+    df -h / | tail -1
+    echo "拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) / $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    echo '```'
+    echo
+    echo "完整日志见本目录各 *.log 文件。"
+  } > "$f"
+  ok "汇总报告: $f"
+  echo
+  cat "$f"
+}
+
+cmd_quick(){ need_root; take_lock; setup_report; test_ip; test_tcp_quick; gen_summary; }
+cmd_full(){  need_root; take_lock; setup_report; test_ip; test_ecs; test_tcp_full; gen_summary; }
+cmd_ip(){    need_root; take_lock; setup_report; test_ip; gen_summary; }
+cmd_ecs(){   need_root; take_lock; setup_report; test_ecs; gen_summary; }
+cmd_tcp(){   need_root; take_lock; setup_report
+  if [ $# -gt 0 ]; then
+    fetch_upstream "$UPSTREAM_TCPQ" runTcpQuality.sh
+    local log="$REPORT_DIR/03-tcpquality-custom.log"
+    run_tool "TCPQuality-自定义" "$log" env TERM=xterm bash "$CACHE_DIR/runTcpQuality.sh" "$@"
+    record_result "TCPQuality-自定义" "$([ $? -eq 0 ] && echo OK || echo FAILED)" "参数: $*"
+  else
+    test_tcp_quick
+  fi
+  gen_summary
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 调优模块
+# ═══════════════════════════════════════════════════════════════════════════
+
+BBR_KEYS="net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_window_scaling net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_moderate_rcvbuf"
+
+bbr_snapshot_take(){
+  mkdir -p "$STATE_DIR"
+  : > "$BBR_SNAPSHOT"
+  local k
+  for k in $BBR_KEYS; do
+    printf '%s = %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null)" >> "$BBR_SNAPSHOT"
+  done
+  tc qdisc show dev "$(detect_iface)" >> "$BBR_SNAPSHOT"
+  ok "快照已保存: $BBR_SNAPSHOT"
+}
+
+conflict_scan(){
+  grep -lE 'tcp_(congestion_control|rmem|wmem)|default_qdisc' /etc/sysctl.d/*.conf 2>/dev/null \
+    | grep -v "^$SYSCTL_BBR$" || true
+}
+
+conflict_guard(){
+  local files; files=$(conflict_scan)
+  [ -n "$files" ] || return 0
+  warn "检测到既有调优配置，与本工具会叠加冲突:"
+  echo "$files" | sed 's/^/      /'
+  echo
+  echo "      1) 备份禁用旧文件，继续（推荐，rollback 时可恢复）"
+  echo "      2) 中止"
+  local ans; printf '      选择 [1/2]: '; read -r ans
+  case "$ans" in
+    1)
+      local f
+      for f in $files; do
+        mv "$f" "${f}.disabled-by-vps-toolkit" && ok "已禁用: ${f}.disabled-by-vps-toolkit"
+      done ;;
+    *) die "用户中止：请先处理既有调优配置" ;;
+  esac
+}
+
+# 按内存推导缓冲区上限（沿用已验证方案：1GB→16M tcp / 32M socket）
+derive_buf(){
+  local ram; ram=$(detect_ram_mb)
+  if   [ "$ram" -le 1536 ]; then echo "16777216 33554432"
+  elif [ "$ram" -le 3072 ]; then echo "33554432 67108864"
+  else                            echo "67108864 134217728"
+  fi
+}
+
+tune_bbr(){
+  need_root; take_lock
+  conflict_guard
+  step "精简 BBR 调优（BBR + fq + 按内存推导缓冲区）"
+  bbr_snapshot_take
+  local tcp_max sock_max; read tcp_max sock_max < <(derive_buf)
+  local ram; ram=$(detect_ram_mb)
+  info "内存 ${ram}MB → TCP 缓冲上限 $((tcp_max/1048576))MB / Socket 上限 $((sock_max/1048576))MB"
+
+  modprobe tcp_bbr 2>/dev/null
+  echo tcp_bbr > /etc/modules-load.d/vps-toolkit-bbr.conf
+  cat > "$SYSCTL_BBR" <<EOF
+# 由 vps-toolkit v$VERSION 生成  $(date -u +%FT%TZ)
+# 勿手改；要改用 vps-toolkit tune --rollback 回滚
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_window_scaling = 1
+net.core.rmem_max = $sock_max
+net.core.wmem_max = $sock_max
+net.ipv4.tcp_rmem = 4096 262144 $tcp_max
+net.ipv4.tcp_wmem = 4096 65536 $tcp_max
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_moderate_rcvbuf = 1
+EOF
+  local serr; serr=$(sysctl -qp "$SYSCTL_BBR" 2>&1 >/dev/null)
+  [ -n "$serr" ] && warn "部分键被内核拒绝: $serr"
+  tc qdisc replace dev "$(detect_iface)" root fq 2>/dev/null
+  # 清理 /etc/sysctl.conf 里可能打架的残留键
+  if grep -qE '^\s*net\.(core\.default_qdisc|ipv4\.tcp_congestion_control)' /etc/sysctl.conf 2>/dev/null; then
+    sed -i 's|^\s*\(net\.\(core\.default_qdisc\|ipv4\.tcp_congestion_control\)\)|# vps-toolkit: disabled dup \1|' /etc/sysctl.conf
+    info "已注释 /etc/sysctl.conf 中的重复键"
+  fi
+  echo "bbr" > "$TUNED_MARK"
+  ok "BBR 调优已应用: $SYSCTL_BBR"
+  tune_status
+}
+
+tune_tcpfit(){
+  need_root; take_lock
+  conflict_guard
+  step "tcpfit 智能调优（实测推导，来自 Kylin010/tcpfit v$TCPFIT_VERSION）"
+  fetch_upstream "$UPSTREAM_TCPFIT" tcpfit.sh
+  warn "tcpfit 将交互式运行，请按它的提示操作"
+  sleep 1
+  bash "$CACHE_DIR/tcpfit.sh" "$@"
+  echo "tcpfit" > "$TUNED_MARK"
+}
+
+tune_status(){
+  step "当前调优状态"
+  kv "拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  kv "默认 qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  kv "网卡 qdisc" "$(tc qdisc show dev "$(detect_iface)" 2>/dev/null | head -1 | awk '{print $2}')"
+  kv "tcp_rmem" "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | tr '\t' ' ')"
+  kv "tcp_wmem" "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | tr '\t' ' ')"
+  kv "rmem_max" "$(sysctl -n net.core.rmem_max 2>/dev/null)"
+  kv "wmem_max" "$(sysctl -n net.core.wmem_max 2>/dev/null)"
+  kv "调优标记" "$([ -f "$TUNED_MARK" ] && cat "$TUNED_MARK" || echo 无)"
+  [ -f "$BBR_SNAPSHOT" ] && kv "回滚快照" "存在（可 rollback）"
+}
+
+tune_rollback(){
+  need_root; take_lock
+  step "回滚到调优前"
+  local done_any=0
+  if [ -f "$BBR_SNAPSHOT" ]; then
+    grep -E '^net\.' "$BBR_SNAPSHOT" | while IFS=' =' read -r k _ v _rest; do
+      [ -n "$k" ] && [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null
+    done
+    rm -f "$SYSCTL_BBR" /etc/modules-load.d/vps-toolkit-bbr.conf
+    tc qdisc replace dev "$(detect_iface)" root fq_codel 2>/dev/null \
+      || tc qdisc replace dev "$(detect_iface)" root pfifo_fast 2>/dev/null
+    ok "已按快照还原 sysctl，移除 $SYSCTL_BBR"
+    rm -f "$BBR_SNAPSHOT"
+    done_any=1
+  fi
+  local f
+  for f in /etc/sysctl.d/*.disabled-by-vps-toolkit; do
+    [ -e "$f" ] || continue
+    mv "$f" "${f%.disabled-by-vps-toolkit}" && ok "已恢复: ${f%.disabled-by-vps-toolkit}"
+    done_any=1
+  done
+  if [ -x /usr/local/bin/tcpfit ]; then
+    info "检测到 tcpfit，执行其 rollback…"
+    /usr/local/bin/tcpfit rollback 2>/dev/null && done_any=1
+  fi
+  sysctl --system >/dev/null 2>&1
+  rm -f "$TUNED_MARK"
+  [ "$done_any" = 1 ] && ok "回滚完成" || warn "没有可回滚的内容（无快照/无标记）"
+}
+
+cmd_tune(){
+  case "${1:-}" in
+    --bbr) tune_bbr ;;
+    --tcpfit) shift; tune_tcpfit "$@" ;;
+    --rollback) tune_rollback ;;
+    --status|"") tune_status ;;
+    *) die "tune 只支持 --bbr / --tcpfit / --rollback / --status" ;;
+  esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# boost 闭环 / 报告管理 / 自更新
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_boost(){
+  need_root; take_lock
+  local mode="bbr"
+  case "${1:-}" in --tcpfit) mode="tcpfit" ;; --bbr|"") ;; *) die "boost 只支持 --bbr / --tcpfit" ;; esac
+
+  step "① 基线测试（调优前）"
+  setup_report
+  local base_dir="$REPORT_DIR"
+  test_tcp_quick
+  local base_zero=""
+  [ -f "$REPORT_DIR/.results" ] && base_zero=$(grep tcpq_quick "$REPORT_DIR/.results" | grep -oE 'zero_loss=[0-9?]+' | cut -d= -f2)
+
+  step "② 应用调优（$mode）"
+  if [ "$mode" = bbr ]; then tune_bbr; else tune_tcpfit; fi
+
+  step "③ 复测（调优后）"
+  local after_log="$base_dir/05-boost-after.log"
+  fetch_upstream "$UPSTREAM_TCPQ" runTcpQuality.sh
+  run_tool "TCPQuality-复测" "$after_log" env TERM=xterm bash "$CACHE_DIR/runTcpQuality.sh" -v4 -bj -sh -gd
+  local parsed after_zero after_link
+  parsed=$(parse_tcpq "$after_log"); after_zero=${parsed%%|*}; after_link=${parsed##*|}
+
+  step "④ 前后对比"
+  rule
+  kv "基线零丢包节点" "${base_zero:-?}"
+  kv "复测零丢包节点" "$after_zero"
+  kv "复测报告链接" "$after_link"
+  rule
+  {
+    echo; echo "## boost 前后对比"
+    echo "- 调优方式: $mode"
+    echo "- 基线零丢包: ${base_zero:-?} / 复测零丢包: $after_zero"
+    echo "- 复测报告: $after_link"
+  } >> "$base_dir/SUMMARY.md"
+  ok "闭环完成，完整报告: $base_dir/SUMMARY.md"
+}
+
+cmd_reports(){
+  [ -d "$REPORT_ROOT" ] || die "还没有任何报告（先跑一次 quick/full）"
+  step "历史报告"
+  ls -1t "$REPORT_ROOT" 2>/dev/null | head -15 | while read -r d; do
+    local s="$REPORT_ROOT/$d/SUMMARY.md"
+    if [ -f "$s" ]; then
+      printf '  %s  %s\n' "$d" "$(grep -m1 '机器:' "$s" | sed 's/.*机器: //' | cut -c1-40)"
+    else
+      printf '  %s\n' "$d"
+    fi
+  done
+  echo
+  printf '  查看某次报告: cat %s/<时间戳>/SUMMARY.md\n' "$REPORT_ROOT"
+}
+
+cmd_update(){
+  need_root
+  command -v curl >/dev/null || die "需要 curl"
+  info "检查更新…"
+  local remote_v=""
+  remote_v=$(curl -fsSL -r 0-300 --max-time 10 \
+    "https://raw.githubusercontent.com/$REPO/main/vps-toolkit" 2>/dev/null \
+    | grep -m1 '^VERSION=' | cut -d'"' -f2)
+  local latest
+  latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+  [ -n "$latest" ] || latest="$remote_v"
+  [ -n "$latest" ] || die "查不到最新版本，检查网络" 2
+  if [ "$latest" = "$VERSION" ]; then ok "已是最新版本 v$VERSION"; return 0; fi
+  if [ "$(printf '%s\n%s\n' "$VERSION" "$latest" | sort -V | tail -1)" = "$VERSION" ]; then
+    ok "当前 v$VERSION 不旧于发布版 v$latest"; return 0
+  fi
+
+  step "发现新版本: v$VERSION → v$latest"
+  confirm "现在更新？" || { info "已取消"; return 0; }
+
+  local dl; dl=$(mktemp -d)
+  local base="https://github.com/$REPO/releases/download/v$latest"
+  download "$base/vps-toolkit" "$dl/vps-toolkit" || { rm -rf "$dl"; die "下载失败" 2; }
+  if command -v sha256sum >/dev/null && download "$base/SHA256SUMS" "$dl/SHA256SUMS"; then
+    ( cd "$dl" && grep ' vps-toolkit$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ) \
+      || { rm -rf "$dl"; die "SHA256 校验不通过，未更新" 2; }
+    ok "SHA256 校验通过"
+  else
+    head -1 "$dl/vps-toolkit" | grep -q '^#!' || { rm -rf "$dl"; die "下载文件校验失败" 2; }
+  fi
+  grep -q "^VERSION=\"$latest\"" "$dl/vps-toolkit" || { rm -rf "$dl"; die "版本标记不一致，未更新" 2; }
+
+  cp "$SELF_PATH" "$SELF_PATH.bak" 2>/dev/null || true
+  if install -m 755 "$dl/vps-toolkit" "$SELF_PATH"; then
+    rm -rf "$dl"; ok "已更新到 v$latest（旧版备份: $SELF_PATH.bak）"
+  else
+    mv "$SELF_PATH.bak" "$SELF_PATH" 2>/dev/null
+    rm -rf "$dl"; die "替换失败，已回滚"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 交互菜单
+# ═══════════════════════════════════════════════════════════════════════════
+
+banner(){
+  printf '%s╔═ %svps-toolkit v%s%s ═══════════════════════════╗%s\n' \
+    "$C_CYAN" "$C_BOLD" "$VERSION" "$C_OFF$C_CYAN" "$C_OFF"
+  printf '%s║%s 画像: %s\n' "$C_CYAN" "$C_OFF" "$(profile_line)"
+  printf '%s╚══════════════════════════════════════════════╝%s\n' "$C_CYAN" "$C_OFF"
+}
+
+break_end(){ printf '\n  %s按回车返回菜单…%s' "$C_DIM" "$C_OFF"; read -r _; }
+
+menu_test(){
+  while true; do
+    printf '\n  %s单项检测%s\n' "$C_BOLD" "$C_OFF"
+    echo "  3.1) IP 质量体检"
+    echo "  3.2) ecs 综合体检"
+    echo "  3.3) TCPQuality（三省市快速）"
+    echo "  3.4) 线路诊断（三网参考目标 ping）"
+    echo "  0) 返回"
+    printf '  请选择: '; read -r c
+    case "$c" in
+      3.1|1) cmd_ip; break_end ;;
+      3.2|2) cmd_ecs; break_end ;;
+      3.3|3) cmd_tcp; break_end ;;
+      3.4|4) diag_routes; break_end ;;
+      0) return ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+menu_tune(){
+  while true; do
+    printf '\n  %sTCP 调优%s\n' "$C_BOLD" "$C_OFF"
+    echo "  4.1) 精简 BBR 调优（BBR+fq+按内存推导缓冲）"
+    echo "  4.2) tcpfit 智能调优（实测推导）"
+    echo "  4.3) tcpfit 限速器扫描（sweep，需近处 iperf3 对端）"
+    echo "  4.4) 查看当前调优状态"
+    echo "  4.5) 回滚到调优前"
+    echo "  0) 返回"
+    printf '  请选择: '; read -r c
+    case "$c" in
+      4.1|1) confirm "将修改 sysctl 与 qdisc（有快照可回滚），继续？" && tune_bbr; break_end ;;
+      4.2|2) tune_tcpfit; break_end ;;
+      4.3|3)
+        printf '  输入近处 iperf3 服务器地址: '; read -r peer
+        [ -n "$peer" ] && { fetch_upstream "$UPSTREAM_TCPFIT" tcpfit.sh; bash "$CACHE_DIR/tcpfit.sh" sweep --peer "$peer"; }
+        break_end ;;
+      4.4|4) tune_status; break_end ;;
+      4.5|5) confirm "确认回滚全部调优？" && tune_rollback; break_end ;;
+      0) return ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+diag_routes(){
+  step "三网参考目标连通性（北京/上海/广东）"
+  local t name
+  for t in "北京电信|219.141.136.12" "北京联通|202.106.50.1" "北京移动|221.179.155.161" \
+           "上海电信|202.96.209.133" "上海联通|210.22.97.1" "上海移动|211.136.112.200" \
+           "广东电信|14.215.116.1" "广东联通|221.5.88.88" "广东移动|120.196.165.24"; do
+    name=${t%%|*}; local ip=${t##*|}
+    local r
+    r=$(ping -c 2 -W 2 "$ip" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+    if [ -n "$r" ]; then printf '  %s %s\n' "$(_pad "$name" 12)" "${r}ms"; else printf '  %s %s\n' "$(_pad "$name" 12)" "不可达/被过滤"; fi
+  done
+}
+
+menu_main(){
+  while true; do
+    clear 2>/dev/null || true
+    banner
+    cat <<EOF
+  1) 快速体检        IP质量 + TCP回国(三省市)
+  2) 完整体检        IP质量 + ecs + TCP回国(全量)
+  3) 单项检测    ▸
+  4) TCP 调优    ▸
+  5) 一键闭环 boost  基线 → 调优 → 复测 → 对比
+  6) 历史报告
+  7) 检查更新
+  0) 退出
+EOF
+    printf '  请选择: '; read -r c
+    case "$c" in
+      1) cmd_quick; break_end ;;
+      2) cmd_full; break_end ;;
+      3) menu_test ;;
+      4) menu_tune ;;
+      5)
+        printf '  调优方式 [1=精简BBR 2=tcpfit]: '; read -r m
+        case "$m" in 2) cmd_boost --tcpfit ;; *) cmd_boost --bbr ;; esac
+        break_end ;;
+      6) cmd_reports; break_end ;;
+      7) cmd_update; break_end ;;
+      0) exit 0 ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+usage(){
+  cat <<EOF
+vps-toolkit v$VERSION — VPS 体检 + TCP 调优编排器
+
+用法:
+  vps-toolkit                  交互菜单
+  vps-toolkit quick            快速体检（IP质量 + TCP三省市回国）
+  vps-toolkit full             完整体检（+ ecs + TCP全量）
+  vps-toolkit ip|ecs           单项检测
+  vps-toolkit tcp [参数]       TCPQuality（可透传如 -bj -sh）
+  vps-toolkit tune --bbr       精简 BBR 调优（快照可回滚）
+  vps-toolkit tune --tcpfit    tcpfit 智能调优
+  vps-toolkit tune --rollback  回滚到调优前
+  vps-toolkit tune --status    当前调优状态
+  vps-toolkit boost [--bbr|--tcpfit]  基线→调优→复测→对比
+  vps-toolkit reports          历史报告
+  vps-toolkit update           检查更新
+  vps-toolkit status           系统画像
+  vps-toolkit --version        版本号
+
+环境变量:
+  VPSK_NO_SWAP=1     跳过自动补 swap
+  VPSK_GH_PROXY=url  自定义 GitHub 代理前缀（CN 环境回退用）
+EOF
+}
+
+main(){
+  case "${1:-menu}" in
+    menu) menu_main ;;
+    quick) cmd_quick ;;
+    full) cmd_full ;;
+    ip) cmd_ip ;;
+    ecs) cmd_ecs ;;
+    tcp) shift; cmd_tcp "$@" ;;
+    tune) shift; cmd_tune "$@" ;;
+    boost) shift; cmd_boost "$@" ;;
+    reports) cmd_reports ;;
+    update) cmd_update ;;
+    status) profile_line ;;
+    --help|-h|help) usage ;;
+    --version|-v) echo "vps-toolkit v$VERSION" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
