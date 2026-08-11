@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: bash -n vps-toolkit
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S style -e SC1090,SC1091,SC2034,SC2155 vps-toolkit
+
+      - name: smoke - help & version
+        run: |
+          chmod +x vps-toolkit
+          ./vps-toolkit --version
+          ./vps-toolkit --help | head -30
+
+      - name: smoke - menu navigation (piped input)
+        run: |
+          printf '7\n0\n0\n' | timeout 60 ./vps-toolkit || true

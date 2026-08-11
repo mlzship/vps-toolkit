@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 022
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 REPO="mlzship/vps-toolkit"
 SELF_PATH="/usr/local/bin/vps-toolkit"
 STATE_DIR="/var/lib/vps-toolkit"
@@ -101,8 +101,8 @@ traffic_report(){
   rx=$(( $(cat "/sys/class/net/$i/statistics/rx_bytes" 2>/dev/null || echo 0) - TRAFFIC_RX0 ))
   tx=$(( $(cat "/sys/class/net/$i/statistics/tx_bytes" 2>/dev/null || echo 0) - TRAFFIC_TX0 ))
   [ "$rx" -lt 0 ] && rx=0; [ "$tx" -lt 0 ] && tx=0
-  awk -v tx="$tx" -v rx="$rx" 'BEGIN{
-    function h(b){ if(b>=1073741824) return sprintf("%.2f GB", b/1073741824); return sprintf("%.0f MB", b/1048576) }
+  awk -v tx="$tx" -v rx="$rx" 'function h(b){ if(b>=1073741824) return sprintf("%.2f GB", b/1073741824); return sprintf("%.0f MB", b/1048576) }
+    BEGIN{
     printf "  %s本次流量消耗%s  上传 %s / 下载 %s\n", "'"$C_DIM"'", "'"$C_OFF"'", h(tx), h(rx)}'
 }
 
@@ -201,16 +201,19 @@ fetch_upstream(){ # fetch_upstream <url> <文件名>
 
 strip_ansi(){ sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$1"; }
 
-extract_links(){ strip_ansi "$1" | grep -oE 'https?://[^ ]*(Check\.Place|tcpquality|Report)[^ ]*' | sort -u; }
+extract_links(){ strip_ansi "$1" | grep -oE 'https?://[^ )]*?(Check\.Place|tcpquality)[^ )]*' | grep -v 'Check\.Place$' | sort -u; }
 
 test_ip(){
   step "IP 质量深度体检（IPQuality）"
   fetch_upstream "$UPSTREAM_IPQ" ip.sh
   local log="$REPORT_DIR/01-ipquality.log"
   traffic_mark
-  run_tool "IPQuality" "$log" bash "$CACHE_DIR/ip.sh"; local rc=$?
+  run_tool "IPQuality" "$log" bash "$CACHE_DIR/ip.sh" || true
   traffic_report
+  # ip.sh 成功出报告也可能退出非 0 —— 以日志里的报告链接为准
   local links; links=$(extract_links "$log" | head -3)
+  local rc=1
+  strip_ansi "$log" | grep -q "报告链接" && rc=0
   record_result "IPQuality" "$([ $rc -eq 0 ] && echo OK || echo FAILED)" "${links:-无报告链接}"
   [ -n "$links" ] && { echo "  报告链接:"; echo "$links" | sed 's/^/    /'; }
   return $rc
