@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 022
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 REPO="mlzship/vps-toolkit"
 SELF_PATH="/usr/local/bin/vps-toolkit"
 STATE_DIR="/var/lib/vps-toolkit"
@@ -677,11 +677,22 @@ rule_verdicts(){ # <report_dir> → 输出评价句（每行一句）
   # 回程线路标签（北京行做代表）
   local tq_log; tq_log=$(ls "$dir"/*tcpquality*.log 2>/dev/null | head -1)
   if [ -n "$tq_log" ]; then
-    local bj ct cu cm
-    bj=$(strip_ansi "$tq_log" | grep -E "^  北京" | head -1)
-    ct=$(echo "$bj" | grep -oE "CN2GIA|163" | head -1); cu=$(echo "$bj" | grep -oE "4837|AS10099|CMIN2" | head -1)
-    cm=$(echo "$bj" | grep -oE "CMIN2|CMI" | head -1)
-    [ -n "$ct$cu$cm" ] && echo "回程线路（北京，据探测）：电信 ${ct:-?} / 联通 ${cu:-?} / 移动 ${cm:-?}。"
+    # 回程线路：北上广逐地区输出，地区名永不省略
+    local region row ct cu cm found
+    for region in 北京 上海 广东; do
+      found=0
+      while IFS= read -r row; do
+        # 三个运营商列以 " / " 分隔，取每列首个标签；跳过 Hidden（大包段无标签行）
+        ct=$(echo "$row" | awk -F' / ' '{print $1}' | grep -oE 'CN2GIA|163|4837|CMI|CMIN2|AS10099|CN2' | head -1)
+        cu=$(echo "$row" | awk -F' / ' '{print $2}' | grep -oE 'CN2GIA|163|4837|CMI|CMIN2|AS10099|CN2' | head -1)
+        cm=$(echo "$row" | awk -F' / ' '{print $3}' | grep -oE 'CN2GIA|163|4837|CMI|CMIN2|AS10099|CN2' | head -1)
+        if [ -n "$ct" ] && [ -n "$cu" ] && [ -n "$cm" ]; then
+          echo "回程线路·${region}（据探测）：电信 ${ct:-未识别} / 联通 ${cu:-未识别} / 移动 ${cm:-未识别}。"
+          found=1; break
+        fi
+      done < <(strip_ansi "$tq_log" | grep -E "^  ${region} ")
+      [ "$found" = 0 ] && echo "回程线路·${region}（据探测）：未识别（探测丢包率高或标签隐藏）。"
+    done
     # 测速汇总
     local speeds
     speeds=$(strip_ansi "$tq_log" | grep -oE '[0-9.]+Mbps' | grep -v '^0\.' | sort -t. -k1 -rn | head -1)
