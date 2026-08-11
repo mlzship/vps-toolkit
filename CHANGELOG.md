@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 (2026-08-12)
+
+- 帖子内容 IP 强制脱敏（机器画像/AI 摘要 payload 中的 IPv4 一律打码）
+- 新增对已发帖的编辑能力（edit-discussion 接口）用于修正内容
+
 ## v0.2.0 (2026-08-12)
 
 - 新增 `publish`：体检报告一键发布到 NodeSeek（规则模板评价引擎 + 可选 LLM 润色 + nodeimage 图床插图）

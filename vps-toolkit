@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 022
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 REPO="mlzship/vps-toolkit"
 SELF_PATH="/usr/local/bin/vps-toolkit"
 STATE_DIR="/var/lib/vps-toolkit"
@@ -704,11 +704,14 @@ rule_verdicts(){ # <report_dir> → 输出评价句（每行一句）
   fi
 }
 
+# IP 脱敏：内容中的 IPv4 一律打码（帖子不公布 IP）
+mask_ip(){ sed -E 's/\b([0-9]{1,3}\.)[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b/\1***.***.***/g'; }
+
 # ── 帖子渲染 ────────────────────────────────────────────────────────────────
 render_post(){ # <report_dir> <title_out_var> <content_out_file>
   local dir="$1"
   local profile zero link ip_link verdicts
-  profile=$(grep -m1 '机器:' "$dir/SUMMARY.md" 2>/dev/null | sed 's/.*机器: //')
+  profile=$(grep -m1 '机器:' "$dir/SUMMARY.md" 2>/dev/null | sed 's/.*机器: //' | mask_ip)
   [ -f "$dir/.results" ] && {
     zero=$(grep tcpq "$dir/.results" | tail -1 | grep -oE 'zero_loss=[0-9?]+' | cut -d= -f2)
     link=$(grep tcpq "$dir/.results" | tail -1 | grep -oE 'link=https?[^ ]+' | cut -d= -f2)
@@ -769,7 +772,7 @@ render_ai(){ # <摘要文件> → stdout: AI 评价文本；失败返回非 0
   . "$LLM_ENV"
   [ -n "${LLM_KEY:-}" ] || return 1
   local ep="${LLM_ENDPOINT:-https://api.deepseek.com/v1}" model="${LLM_MODEL:-deepseek-chat}"
-  local data; data=$(cat "$1")
+  local data; data=$(mask_ip < "$1")
   echo "  将发送给 LLM 的数据（${ep##*://}，${model}）：" >&2
   echo "$data" | head -20 | sed 's/^/    /' >&2
   confirm "确认调用 AI 生成评价？" >&2 || return 2
