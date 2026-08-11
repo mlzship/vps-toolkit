@@ -6,16 +6,29 @@ VPS 体检 + TCP 调优一体化工具：检测 → 诊断 → 调优 → 复测
 
 ## 快速开始
 
-```bash
-# 交互菜单（推荐）
-bash <(curl -fsSL https://raw.githubusercontent.com/mlzship/vps-toolkit/main/vps-toolkit)
+### 方式一：免安装直接运行（推荐试用）
 
-# 或安装后使用
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/mlzship/vps-toolkit/main/vps-toolkit)
+```
+
+### 方式二：安装到系统
+
+```bash
+# 1. 下载安装
 curl -fsSL https://raw.githubusercontent.com/mlzship/vps-toolkit/main/vps-toolkit -o /usr/local/bin/vps-toolkit
 chmod +x /usr/local/bin/vps-toolkit
+
+# 2.（可选）注册短命令 vt
 ln -sf /usr/local/bin/vps-toolkit /usr/local/bin/vt
+
+# 3. 启动（打开交互菜单）
 vps-toolkit
+# 或
+vt
 ```
+
+启动后即可看到主菜单，按数字键选择功能；全部功能也支持非交互子命令（见下文命令行）。
 
 ## 功能
 
